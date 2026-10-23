@@ -1,0 +1,48 @@
+.TH NWSTOP 1 "October 2026" "nwstop 1.0.0" "User Commands"
+.SH NAME
+nwstop \- network traffic monitor for VPN nodes
+.SH SYNOPSIS
+.B nwstop
+[\fB\-i\fR \fIIFACE\fR] [\fB\-\-vpn\-ports\fR \fIPORTS\fR] [\fB\-\-no\-dns\fR] [\fB\-\-mouse\fR]
+.SH DESCRIPTION
+.B nwstop
+captures packets on a network interface and shows, per remote IP address,
+the service name, port, current rates and total transferred bytes.
+It must be run as root.
+.SH OPTIONS
+.TP
+.BR \-i ", " \-\-iface " " \fIIFACE\fR
+Interface to monitor. Defaults to the interface of the default route.
+.TP
+.BI \-\-vpn\-ports " PORTS"
+Comma-separated local ports on which clients connect. Default: 443.
+.TP
+.B \-\-no\-dns
+Do not resolve reverse DNS names.
+.TP
+.B \-\-mouse
+Enable mouse wheel scrolling.
+.SH KEYS
+.TP
+.BR j ", " k ", arrows, PgUp, PgDn, g, G"
+Scroll.
+.TP
+.BR 1 \- 4
+Sort by 2s rate, 10s rate, 40s rate, total bytes.
+.TP
+.B c
+Show only VPN clients.
+.TP
+.B /
+Filter by IP, host or service.
+.TP
+.B p
+Pause.
+.TP
+.B n
+Toggle reverse DNS.
+.TP
+.B q
+Quit.
+.SH AUTHOR
+DarkRezet <darkrezet.music@gmail.com>

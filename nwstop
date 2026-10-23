@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+import argparse
+import curses
+import ipaddress
+import locale
+import os
+import queue
+import socket
+import struct
+import sys
+import threading
+import time
+from collections import deque
+from functools import lru_cache
+from itertools import islice
+
+HIST = 40
+IDLE_DROP = 180
+
+PORT_NAMES = {
+    20: "ftp", 21: "ftp", 22: "ssh", 25: "smtp", 53: "dns", 80: "http",
+    110: "pop3", 123: "ntp", 143: "imap", 443: "https", 465: "smtps",
+    587: "smtp", 853: "dot", 993: "imaps", 1194: "openvpn", 3478: "stun",
+    3389: "rdp", 5222: "xmpp", 5228: "gcm", 8080: "http-alt", 8443: "https-alt",
+    51413: "torrent", 51820: "wireguard",
+}
+
+SERVICE_HOSTS = [
+    ("cloudfront.net", "CloudFront"), ("amazonaws.com", "AWS"),
+    ("googlevideo.com", "YouTube"), ("youtube", "YouTube"),
+    ("1e100.net", "Google"), ("google", "Google"),
+    ("facebook.com", "Meta"), ("fbcdn.net", "Meta"), ("instagram", "Instagram"),
+    ("whatsapp", "WhatsApp"), ("vk.com", "VK"), ("vkontakte", "VK"),
+    ("userapi.com", "VK"), ("mail.ru", "Mail.ru"), ("yandex", "Yandex"),
+    ("telegram", "Telegram"), ("discord", "Discord"), ("tiktok", "TikTok"),
+    ("netflix", "Netflix"), ("nflxvideo", "Netflix"), ("spotify", "Spotify"),
+    ("twitch", "Twitch"), ("steam", "Steam"), ("github", "GitHub"),
+    ("microsoft", "Microsoft"), ("azure", "Azure"), ("apple.com", "Apple"),
+    ("akamai", "Akamai"), ("fastly", "Fastly"), ("one.one.one.one", "Cloudflare DNS"),
+    ("cloudflare", "Cloudflare"), ("hetzner", "Hetzner"), ("ovh", "OVH"),
+    ("digitalocean", "DigitalOcean"),
+]
+
+_NETS_RAW = [
+    ("149.154.160.0/20", "Telegram"), ("91.108.4.0/22", "Telegram"),
+    ("91.108.8.0/21", "Telegram"), ("91.108.16.0/21", "Telegram"),
+    ("91.108.56.0/22", "Telegram"), ("95.161.64.0/20", "Telegram"),
+    ("2001:b28:f23d::/48", "Telegram"), ("2001:67c:4e8::/48", "Telegram"),
+    ("1.1.1.0/24", "Cloudflare DNS"), ("1.0.0.0/24", "Cloudflare DNS"),
+    ("104.16.0.0/13", "Cloudflare"), ("104.24.0.0/14", "Cloudflare"),
+    ("162.158.0.0/15", "Cloudflare"), ("172.64.0.0/13", "Cloudflare"),
+    ("188.114.96.0/20", "Cloudflare"), ("141.101.64.0/18", "Cloudflare"),
+    ("108.162.192.0/18", "Cloudflare"), ("190.93.240.0/20", "Cloudflare"),
+    ("198.41.128.0/17", "Cloudflare"), ("173.245.48.0/20", "Cloudflare"),
+    ("103.21.244.0/22", "Cloudflare"), ("103.22.200.0/22", "Cloudflare"),
+    ("103.31.4.0/22", "Cloudflare"), ("2606:4700::/32", "Cloudflare"),
+    ("8.8.8.0/24", "Google DNS"), ("8.8.4.0/24", "Google DNS"),
+    ("9.9.9.0/24", "Quad9 DNS"),
+    ("199.232.0.0/16", "Fastly"), ("151.101.0.0/16", "Fastly"),
+    ("157.240.0.0/16", "Meta"), ("31.13.24.0/21", "Meta"),
+    ("31.13.64.0/18", "Meta"), ("179.60.192.0/22", "Meta"),
+    ("185.60.216.0/22", "Meta"), ("2a03:2880::/32", "Meta"),
+    ("2a00:1450::/32", "Google"),
+    ("87.240.128.0/18", "VK"), ("95.213.0.0/18", "VK"), ("93.186.224.0/20", "VK"),
+    ("185.32.248.0/22", "VK"), ("5.61.16.0/21", "VK"), ("5.61.232.0/21", "VK"),
+    ("77.88.0.0/18", "Yandex"), ("5.255.192.0/18", "Yandex"),
+    ("87.250.224.0/19", "Yandex"), ("213.180.192.0/19", "Yandex"),
+    ("93.158.128.0/18", "Yandex"), ("141.8.128.0/18", "Yandex"),
+]
+SERVICE_NETS = [(ipaddress.ip_network(c), n) for c, n in _NETS_RAW]
+
+RESIDENTIAL = ("dynamic", "pool", "ppp", "dsl", "broadband", "dhcp", "cust",
+               "ufanet", "mgts", "rostelecom", "beeline", "megafon", "mts")
+
+
+@lru_cache(maxsize=65536)
+def ip_str(raw):
+    if len(raw) == 4:
+        return socket.inet_ntoa(raw)
+    return socket.inet_ntop(socket.AF_INET6, raw)
+
+
+@lru_cache(maxsize=65536)
+def net_service(ip):
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ""
+    for net, name in SERVICE_NETS:
+        if addr in net:
+            return name
+    return ""
+
+
+def service_of(ip, host):
+    if host:
+        h = host.lower()
+        for sub, name in SERVICE_HOSTS:
+            if sub in h:
+                return name
+    name = net_service(ip)
+    if name:
+        return name
+    if host and any(x in host.lower() for x in RESIDENTIAL):
+        return "абонент"
+    return ""
+
+
+def port_label(p):
+    if not p:
+        return "-"
+    name = PORT_NAMES.get(p)
+    if not name and 6881 <= p <= 6999:
+        name = "torrent"
+    return f"{p}/{name}" if name else str(p)
+
+
+def fmt_bits(v):
+    units = ["b", "Kb", "Mb", "Gb"]
+    i = 0
+    while v >= 1000 and i < 3:
+        v /= 1000
+        i += 1
+    return f"{v:.0f}{units[i]}" if i == 0 else f"{v:.1f}{units[i]}"
+
+
+def fmt_bytes(v):
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    i = 0
+    while v >= 1024 and i < 4:
+        v /= 1024
+        i += 1
+    return f"{v:.0f}{units[i]}" if i == 0 else f"{v:.1f}{units[i]}"
+
+
+def default_iface():
+    try:
+        with open("/proc/net/route") as f:
+            next(f)
+            for line in f:
+                p = line.split()
+                if p[1] == "00000000" and int(p[3], 16) & 2:
+                    return p[0]
+    except OSError:
+        pass
+    return "eth0"
+
+
+def read_dev(iface):
+    try:
+        with open("/proc/net/dev") as f:
+            for line in f:
+                if line.strip().startswith(iface + ":"):
+                    p = line.split(":", 1)[1].split()
+                    return int(p[8]), int(p[0])
+    except OSError:
+        pass
+    return 0, 0
+
+
+def rate(hist, n):
+    if not hist:
+        return 0.0, 0.0
+    items = list(islice(reversed(hist), n))
+    return (sum(a for a, _ in items) * 8 / n, sum(b for _, b in items) * 8 / n)
+
+
+class Flow:
+    __slots__ = ("tx", "rx", "hist", "txt", "rxt", "ports", "cli", "seen")
+
+    def __init__(self):
+        self.tx = self.rx = self.txt = self.rxt = self.cli = 0
+        self.hist = deque(maxlen=HIST)
+        self.ports = {}
+        self.seen = time.monotonic()
+
+
+class Store:
+    def __init__(self, iface, vpn_ports):
+        self.iface = iface
+        self.vpn = vpn_ports
+        self.lock = threading.Lock()
+        self.flows = {}
+        self.dev_hist = deque(maxlen=HIST)
+        self.dev_prev = read_dev(iface)
+
+    def add(self, key, out, size, lport, rport):
+        with self.lock:
+            f = self.flows.get(key)
+            if f is None:
+                f = self.flows[key] = Flow()
+            if out:
+                f.tx += size
+                f.txt += size
+            else:
+                f.rx += size
+                f.rxt += size
+            p = min(lport, rport) if (lport and rport) else 0
+            if p:
+                if p in f.ports:
+                    f.ports[p] += size
+                elif len(f.ports) < 16:
+                    f.ports[p] = size
+            if lport in self.vpn and rport >= 1024:
+                f.cli += size
+
+    def tick(self):
+        now = time.monotonic()
+        cur = read_dev(self.iface)
+        with self.lock:
+            self.dev_hist.append((max(0, cur[0] - self.dev_prev[0]),
+                                  max(0, cur[1] - self.dev_prev[1])))
+            self.dev_prev = cur
+            dead = []
+            for k, f in self.flows.items():
+                f.hist.append((f.tx, f.rx))
+                if f.tx or f.rx:
+                    f.seen = now
+                elif now - f.seen > IDLE_DROP:
+                    dead.append(k)
+                f.tx = f.rx = 0
+            for k in dead:
+                del self.flows[k]
+
+    def snapshot(self):
+        out = []
+        with self.lock:
+            for k, f in self.flows.items():
+                t2, r2 = rate(f.hist, 2)
+                t10, r10 = rate(f.hist, 10)
+                t40, r40 = rate(f.hist, 40)
+                tot = f.txt + f.rxt
+                top = sorted(f.ports.items(), key=lambda x: -x[1])[:3]
+                out.append({
+                    "key": k, "t2": t2, "r2": r2, "t10": t10, "r10": r10,
+                    "t40": t40, "r40": r40, "txt": f.txt, "rxt": f.rxt,
+                    "ports": [p for p, _ in top],
+                    "client": tot > 0 and f.cli * 2 >= tot,
+                })
+            dev = list(self.dev_hist)
+        return out, dev
+
+
+class Resolver:
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self.cache = {}
+        self.pending = set()
+        self.q = queue.Queue()
+        for _ in range(6):
+            threading.Thread(target=self._work, daemon=True).start()
+
+    def _work(self):
+        while True:
+            ip = self.q.get()
+            try:
+                host = socket.gethostbyaddr(ip)[0]
+            except Exception:
+                host = ""
+            self.cache[ip] = host
+            self.pending.discard(ip)
+
+    def get(self, ip):
+        host = self.cache.get(ip)
+        if host is None:
+            if self.enabled and ip not in self.pending and self.q.qsize() < 500:
+                self.pending.add(ip)
+                self.q.put(ip)
+            return ""
+        return host
+
+
+def sniff(iface, store, stop):
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+    s.bind((iface, 0))
+    s.settimeout(0.5)
+    try:
+        with open(f"/sys/class/net/{iface}/type") as f:
+            ltype = int(f.read())
+    except (OSError, ValueError):
+        ltype = 1
+    off = 14 if ltype == 1 else 0
+    while not stop.is_set():
+        try:
+            data, addr = s.recvfrom(65535)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        if ltype == 1 and addr[1] not in (0x0800, 0x86DD):
+            continue
+        n = len(data)
+        if n < off + 20:
+            continue
+        out = addr[2] == 4
+        v = data[off] >> 4
+        if v == 4:
+            po = off + (data[off] & 15) * 4
+            proto = data[off + 9]
+            sa, da = data[off + 12:off + 16], data[off + 16:off + 20]
+        elif v == 6:
+            po = off + 40
+            proto = data[off + 6]
+            sa, da = data[off + 8:off + 24], data[off + 24:off + 40]
+        else:
+            continue
+        if proto in (6, 17) and n >= po + 4:
+            sp, dp = struct.unpack_from("!HH", data, po)
+        else:
+            sp = dp = 0
+        remote, rport, lport = (da, dp, sp) if out else (sa, sp, dp)
+        r0 = remote[0]
+        if len(remote) == 4:
+            if r0 >= 224 or r0 in (0, 127):
+                continue
+        elif r0 == 0xFF:
+            continue
+        store.add(remote, out, n, lport, rport)
+
+
+def ticker(store, stop):
+    nxt = time.monotonic() + 1
+    while not stop.is_set():
+        time.sleep(max(0, nxt - time.monotonic()))
+        nxt += 1
+        store.tick()
+
+
+SORTS = {"1": ("now", lambda r: r["t2"] + r["r2"]),
+         "2": ("10с", lambda r: r["t10"] + r["r10"]),
+         "3": ("40с", lambda r: r["t40"] + r["r40"]),
+         "4": ("всего", lambda r: r["txt"] + r["rxt"])}
+
+COLS = [("IP", 22, "l"), ("Сервис", 16, "l"), ("Порт", 12, "l"),
+        ("↑2с", 9, "r"), ("↓2с", 9, "r"), ("↑10с", 9, "r"), ("↓10с", 9, "r"),
+        ("↑всего", 10, "r"), ("↓всего", 10, "r")]
+
+
+def ui(stdscr, store, res, args):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    for i, c in enumerate((curses.COLOR_GREEN, curses.COLOR_YELLOW,
+                           curses.COLOR_RED, curses.COLOR_CYAN), 1):
+        curses.init_pair(i, c, -1)
+    if args.mouse:
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    stdscr.keypad(True)
+    stdscr.timeout(500)
+
+    sort_id = "1"
+    sel, sel_key, top = 0, None, 0
+    paused, frozen = False, None
+    flt = ""
+    only_cli = False
+
+    def put(y, x, text, attr=0):
+        h, w = stdscr.getmaxyx()
+        if 0 <= y < h and x < w - 1:
+            try:
+                stdscr.addnstr(y, x, text, w - x - 1, attr)
+            except curses.error:
+                pass
+
+    def build():
+        flows, dev = store.snapshot()
+        rows = []
+        for r in flows:
+            ip = ip_str(r["key"])
+            host = res.get(ip)
+            r["ip"], r["host"] = ip, host
+            r["svc"] = service_of(ip, host)
+            if only_cli and not r["client"]:
+                continue
+            if flt:
+                blob = f"{ip} {host} {r['svc']}".lower()
+                if flt.lower() not in blob:
+                    continue
+            rows.append(r)
+        rows.sort(key=SORTS[sort_id][1], reverse=True)
+        return rows, dev
+
+    while True:
+        h, w = stdscr.getmaxyx()
+        if paused and frozen is not None:
+            rows, dev = frozen
+        else:
+            rows, dev = build()
+            frozen = (rows, dev)
+        body_h = max(1, h - 5)
+
+        keys = [r["key"] for r in rows]
+        if sel_key in keys:
+            sel = keys.index(sel_key)
+        else:
+            sel = max(0, min(sel, len(rows) - 1))
+        sel_key = rows[sel]["key"] if rows else None
+        if sel < top:
+            top = sel
+        if sel >= top + body_h:
+            top = sel - body_h + 1
+        top = max(0, min(top, max(0, len(rows) - body_h)))
+
+        stdscr.erase()
+        dt, dr = rate(deque(dev), 2)
+        title = (f" nwstop  {store.iface}  ↑{fmt_bits(dt)}/s  ↓{fmt_bits(dr)}/s"
+                 f"  потоков:{len(rows)}  сорт:{SORTS[sort_id][0]}")
+        if paused:
+            title += "  [ПАУЗА]"
+        if only_cli:
+            title += "  [клиенты]"
+        if flt:
+            title += f"  [фильтр: {flt}]"
+        if not res.enabled:
+            title += "  [DNS off]"
+        put(0, 0, title.ljust(w - 1), curses.A_REVERSE | curses.color_pair(4))
+
+        used, cols = 0, []
+        for c in COLS:
+            if used + c[1] + 1 > w - 1:
+                break
+            cols.append(c)
+            used += c[1] + 1
+        host_w = w - 1 - used
+        show_host = host_w >= 12
+
+        def line(vals, host):
+            parts = []
+            for (name, cw, al), v in zip(cols, vals):
+                v = str(v)[:cw]
+                parts.append(v.ljust(cw) if al == "l" else v.rjust(cw))
+            s = " ".join(parts)
+            if show_host:
+                s += " " + host
+            return s
+
+        put(1, 0, line([c[0] for c in cols], "Хост").ljust(w - 1),
+            curses.A_BOLD | curses.A_UNDERLINE)
+
+        for i in range(body_h):
+            idx = top + i
+            if idx >= len(rows):
+                break
+            r = rows[idx]
+            main = r["t10"] + r["r10"]
+            attr = 0
+            if r["client"]:
+                attr = curses.color_pair(1)
+            if main > 20e6:
+                attr = curses.color_pair(3)
+            elif main > 5e6:
+                attr = curses.color_pair(2)
+            ptxt = port_label(r["ports"][0]) if r["ports"] else "-"
+            svc = ("* " if r["client"] else "") + (r["svc"] or "-")
+            vals = [r["ip"], svc, ptxt,
+                    fmt_bits(r["t2"]), fmt_bits(r["r2"]),
+                    fmt_bits(r["t10"]), fmt_bits(r["r10"]),
+                    fmt_bytes(r["txt"]), fmt_bytes(r["rxt"])]
+            if idx == sel:
+                attr |= curses.A_REVERSE
+            put(2 + i, 0, line(vals, r["host"]).ljust(w - 1), attr)
+
+        if rows:
+            r = rows[sel]
+            d1 = f" {r['ip']}  {r['host'] or '(нет rDNS)'}"
+            d2 = (f" сервис: {r['svc'] or '-'}"
+                  f"  порты: {', '.join(port_label(p) for p in r['ports']) or '-'}"
+                  f"  ↑{fmt_bytes(r['txt'])} ↓{fmt_bytes(r['rxt'])}"
+                  f"{'  [клиент VPN]' if r['client'] else ''}"
+                  f"   {sel + 1}/{len(rows)}")
+            put(h - 3, 0, d1.ljust(w - 1), curses.color_pair(4))
+            put(h - 2, 0, d2.ljust(w - 1), curses.color_pair(4))
+        help_ = (" j/k ↑↓ PgUp/PgDn g/G листать | 1-4 сорт | c клиенты"
+                 " | / фильтр | p пауза | n DNS | q выход")
+        put(h - 1, 0, help_.ljust(w - 1), curses.A_DIM)
+        stdscr.refresh()
+
+        k = stdscr.getch()
+        if k == -1:
+            continue
+        move = None
+        if k in (ord("q"), 27):
+            return
+        elif k in (ord("j"), curses.KEY_DOWN):
+            move = sel + 1
+        elif k in (ord("k"), curses.KEY_UP):
+            move = sel - 1
+        elif k in (curses.KEY_NPAGE, ord(" "), 6):
+            move = sel + body_h
+        elif k in (curses.KEY_PPAGE, ord("b"), 2):
+            move = sel - body_h
+        elif k in (ord("g"), curses.KEY_HOME):
+            move = 0
+        elif k in (ord("G"), curses.KEY_END):
+            move = len(rows) - 1
+        elif k == curses.KEY_MOUSE:
+            try:
+                bstate = curses.getmouse()[4]
+                if bstate & curses.BUTTON4_PRESSED:
+                    move = sel - 3
+                elif bstate & getattr(curses, "BUTTON5_PRESSED", 0x200000):
+                    move = sel + 3
+            except curses.error:
+                pass
+        elif chr(k) in SORTS if 0 <= k < 256 else False:
+            sort_id = chr(k)
+        elif k == ord("p"):
+            paused = not paused
+        elif k == ord("c"):
+            only_cli = not only_cli
+            sel, top = 0, 0
+        elif k == ord("n"):
+            res.enabled = not res.enabled
+        elif k == ord("/"):
+            curses.echo()
+            curses.curs_set(1)
+            stdscr.timeout(-1)
+            put(h - 1, 0, " " * (w - 1))
+            put(h - 1, 0, " фильтр (пусто = сброс): ")
+            try:
+                flt = stdscr.getstr(h - 1, 25, 40).decode(errors="ignore").strip()
+            except curses.error:
+                flt = ""
+            curses.noecho()
+            curses.curs_set(0)
+            stdscr.timeout(500)
+            sel, top = 0, 0
+        if move is not None and rows:
+            sel = max(0, min(len(rows) - 1, move))
+            sel_key = rows[sel]["key"]
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="nwstop",
+                                 description="монитор трафика для VPN-нод: IP, сервис, порт")
+    ap.add_argument("-i", "--iface", help="интерфейс (по умолчанию — с default route)")
+    ap.add_argument("--vpn-ports", default="443",
+                    help="порты, на которых нода принимает клиентов (через запятую)")
+    ap.add_argument("--no-dns", action="store_true", help="не резолвить rDNS")
+    ap.add_argument("--mouse", action="store_true",
+                    help="колесо мыши (отключает выделение текста в терминале)")
+    args = ap.parse_args()
+
+    if os.geteuid() != 0:
+        sys.exit("Нужен root: sudo nwstop.py -i <интерфейс>")
+    iface = args.iface or default_iface()
+    if not os.path.isdir(f"/sys/class/net/{iface}"):
+        sys.exit(f"Нет интерфейса {iface}")
+    vpn_ports = {int(p) for p in args.vpn_ports.split(",") if p.strip()}
+
+    locale.setlocale(locale.LC_ALL, "")
+    store = Store(iface, vpn_ports)
+    res = Resolver(not args.no_dns)
+    stop = threading.Event()
+    threading.Thread(target=sniff, args=(iface, store, stop), daemon=True).start()
+    threading.Thread(target=ticker, args=(store, stop), daemon=True).start()
+    try:
+        curses.wrapper(ui, store, res, args)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+
+
+if __name__ == "__main__":
+    main()
